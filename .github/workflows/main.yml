@@ -1,0 +1,101 @@
+name: Build SM-T355 Kernel (msm8916 / gt58lte)
+
+# Runs on GitHub's x86_64 runners on purpose: the prebuilt tools/dtbTool and
+# tools/mkbootimg in this tree are 32-bit x86 ELF binaries with no source in
+# the repo, and the reference toolchain is x86_64-hosted. Both just work here
+# with zero patching, unlike on an arm64 Droidspaces host.
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Device variant defconfig fragment"
+        required: true
+        default: "gt58lte"
+        type: choice
+        options:
+          - gt58lte
+          - gt58wifi
+      toolchain_ref:
+        description: "AOSP arm-eabi-4.9 prebuilt toolchain branch/tag"
+        required: true
+        default: "master"
+
+env:
+  ARCH: arm
+  KERNEL_DIR: ${{ github.workspace }}
+  TOOLCHAIN_DIR: ${{ github.workspace }}/toolchain
+  OUT_DIR: ${{ github.workspace }}/out
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # tools/dtbTool and tools/mkbootimg are 32-bit x86 ELF binaries.
+      # ubuntu-22.04 runners are x86_64, so we need i386 multiarch libs
+      # for the dynamic linker (/lib/ld-linux.so.2) to resolve.
+      - name: Enable i386 multiarch and install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev \
+            libncurses-dev libncurses5 \
+            git curl \
+            lib32z1 lib32stdc++6 lib32ncurses6 \
+            libc6:i386 libstdc++6:i386 zlib1g:i386 ncurses-base:i386
+
+      # AOSP's prebuilt arm-eabi-4.9 is x86_64-hosted, well-tested against
+      # this kernel generation, and avoids chasing dead Linaro mirror URLs.
+      - name: Fetch arm-eabi-4.9 cross toolchain
+        run: |
+          git clone --depth=1 --branch "${{ inputs.toolchain_ref }}" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-eabi-4.9 \
+            "${{ env.TOOLCHAIN_DIR }}"
+          echo "${{ env.TOOLCHAIN_DIR }}/bin" >> "$GITHUB_PATH"
+
+      - name: Fix executable bits on prebuilt tools
+        run: |
+          chmod +x tools/dtbTool tools/mkbootimg
+
+      - name: Configure kernel
+        run: |
+          export CROSS_COMPILE="${{ env.TOOLCHAIN_DIR }}/bin/arm-eabi-"
+          make -C "${{ env.KERNEL_DIR }}" \
+            msm8916_sec_defconfig \
+            VARIANT_DEFCONFIG=msm8916_sec_${{ inputs.variant }}_eur_defconfig \
+            SELINUX_DEFCONFIG=selinux_defconfig
+          # ashyx's script overwrites the merged config with his own
+          # pre-expanded defconfig -- keep that behavior for parity.
+          cp "arch/arm/configs/ashyx_${{ inputs.variant }}_defconfig" .config
+
+      - name: Build kernel
+        run: |
+          export CROSS_COMPILE="${{ env.TOOLCHAIN_DIR }}/bin/arm-eabi-"
+          make -C "${{ env.KERNEL_DIR }}" -j"$(nproc)"
+
+      - name: Build dt.img
+        run: |
+          tools/dtbTool -s 2048 -o arch/arm/boot/dt.img -p scripts/dtc/ arch/arm/boot/dts/
+
+      - name: Stage build outputs
+        run: |
+          mkdir -p "${{ env.OUT_DIR }}"
+          cp arch/arm/boot/zImage "${{ env.OUT_DIR }}/"
+          cp arch/arm/boot/dt.img "${{ env.OUT_DIR }}/"
+          cp .config "${{ env.OUT_DIR }}/kernel.config"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm-t355-kernel-${{ inputs.variant }}-${{ github.run_number }}
+          path: |
+            ${{ env.OUT_DIR }}/zImage
+            ${{ env.OUT_DIR }}/dt.img
+            ${{ env.OUT_DIR }}/kernel.config
+          retention-days: 14
